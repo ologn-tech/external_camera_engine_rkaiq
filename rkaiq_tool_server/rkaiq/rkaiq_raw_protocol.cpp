@@ -755,9 +755,67 @@ static void SetCapConf(CommandData_t* recv_cmd, CommandData_t* cmd, int ret_stat
     }
 }
 
+#define S8(src, w, h, x, y) ((x) >= 0 && (y) >= 0 && (x) < (w) && (y) < (h) ? src[(y) * (w) + (x)] : 0)
+
+// Tạo ảnh Bayer BGGR (1 kênh) từ raw RGB-IR 4×4 (IR coi là Red)
+static void rgbir_to_bggr(uint8_t *dst, uint8_t *src, int w, int h)
+{
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			int bx = (x & ~3), by = (y & ~3);
+			int lx = x & 3, ly = y & 3;
+
+			uint8_t val = src[y * w + x];
+
+			if ((x & 1) == 1 && (y & 1) == 1) {
+				if (lx == 1 && ly == 1) {
+					uint8_t r1 = S8(src, w, h, bx + 0, by + 2);
+					uint8_t r2 = S8(src, w, h, bx + 2, by + 0);
+					val = (r1 + r2) / 2;
+				} else if (lx == 1 && ly == 3) {
+					uint8_t r1 = S8(src, w, h, bx + 0, by + 2);
+					uint8_t r2 = S8(src, w, h, bx + 4 + 2, by + 0);
+					val = (r1 + r2) / 2;
+				} else if (lx == 3 && ly == 1) {
+					uint8_t r1 = S8(src, w, h, bx + 2, by + 0);
+					uint8_t r2 = S8(src, w, h, bx + 0, by + 4 + 2);
+					val = (r1 + r2) / 2;
+				} else if (lx == 3 && ly == 3) {
+					uint8_t r1 = S8(src, w, h, bx + 4 + 2, by + 0);
+					uint8_t r2 = S8(src, w, h, bx + 0, by + 4 + 2);
+					val = (r1 + r2) / 2;
+				}
+			} else if ((x & 1) == 0 && (y & 1) == 0) {
+				if ((lx == 0 && ly == 0) || (lx == 2 && ly == 2)) {
+				} else {
+					uint8_t b1 = S8(src, w, h, bx + 0, by + 0);
+					uint8_t b2 = S8(src, w, h, bx + 2, by + 2);
+					uint8_t b3 = (ly == 2) ? S8(src, w, h, bx + 0, by - 2) : S8(src, w, h, bx + 4, by + 0);
+					uint8_t b4 = (ly == 2) ? S8(src, w, h, bx + 2, by - 2) : S8(src, w, h, bx + 2, by + 4);
+
+					val = (b1 + b2 + b3 + b4) / 4;
+				}
+			} else {
+			}
+
+			dst[y * w + x] = val;
+		}
+	}
+}
+
+static void ModifyFrameData(void* buffer, int size, int width, int height)
+{
+    uint8_t *buf_bggr = (uint8_t*)malloc(size);
+    memcpy(buf_bggr, buffer, size);
+    rgbir_to_bggr((uint8_t*)buffer, buf_bggr, width, height);
+    free(buf_bggr);
+}
+
 static void SendRawData(int socket, int index, void* buffer, int size)
 {
     assert(buffer);
+
+    ModifyFrameData(buffer, size, cap_info.width, cap_info.height);
 
     char* buf = NULL;
     int total = size;

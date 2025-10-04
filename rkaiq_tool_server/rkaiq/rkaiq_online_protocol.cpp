@@ -135,6 +135,33 @@ struct YuvCaptureBuffer
     size_t length;
 };
 
+// Raw capture structures
+struct RawCaptureBuffer
+{
+    void* start;
+    size_t length;
+};
+
+// Raw capture info structure
+struct raw_capture_info
+{
+    int fd_sensor;           // /dev/video0
+    int fd_rawrd;            // /dev/video17
+    struct RawCaptureBuffer* sensor_buffers;
+    struct RawCaptureBuffer* rawrd_buffers;
+    unsigned int sensor_buffer_count;
+    unsigned int rawrd_buffer_count;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpl;            // bytes per line (stride)
+    size_t sizeimage;
+    uint8_t* conversion_buffer;
+    int capture_active;
+};
+
+// Global raw capture info for RGB-IR to BGGR conversion
+static struct raw_capture_info g_raw_capture_info;
+
 static std::string GetFirstDirectory(const std::string& path)
 {
     size_t pos = path.find('/', 1);
@@ -689,10 +716,73 @@ static void ExecuteCMD(const char* cmd, char* result)
     }
 }
 
+// Raw capture helper functions
+#define S8(src, w, h, x, y) ((x) >= 0 && (y) >= 0 && (x) < (w) && (y) < (h) ? src[(y) * (w) + (x)] : 0)
+
+// Convert RGB-IR 4x4 pattern to BGGR Bayer pattern
+static void rgbir_to_bggr(uint8_t *dst, uint8_t *src, int w, int h)
+{
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int bx = (x & ~3), by = (y & ~3);
+            int lx = x & 3, ly = y & 3;
+
+            uint8_t val = src[y * w + x];
+
+            if ((x & 1) == 1 && (y & 1) == 1) {
+                if (lx == 1 && ly == 1) {
+                    uint8_t r1 = S8(src, w, h, bx + 0, by + 2);
+                    uint8_t r2 = S8(src, w, h, bx + 2, by + 0);
+                    val = (r1 + r2) / 2;
+                } else if (lx == 1 && ly == 3) {
+                    uint8_t r1 = S8(src, w, h, bx + 0, by + 2);
+                    uint8_t r2 = S8(src, w, h, bx + 4 + 2, by + 0);
+                    val = (r1 + r2) / 2;
+                } else if (lx == 3 && ly == 1) {
+                    uint8_t r1 = S8(src, w, h, bx + 2, by + 0);
+                    uint8_t r2 = S8(src, w, h, bx + 0, by + 4 + 2);
+                    val = (r1 + r2) / 2;
+                } else if (lx == 3 && ly == 3) {
+                    uint8_t r1 = S8(src, w, h, bx + 4 + 2, by + 0);
+                    uint8_t r2 = S8(src, w, h, bx + 0, by + 4 + 2);
+                    val = (r1 + r2) / 2;
+                }
+            } else if ((x & 1) == 0 && (y & 1) == 0) {
+                if ((lx == 0 && ly == 0) || (lx == 2 && ly == 2)) {
+                } else {
+                    uint8_t b1 = S8(src, w, h, bx + 0, by + 0);
+                    uint8_t b2 = S8(src, w, h, bx + 2, by + 2);
+                    uint8_t b3 = (ly == 2) ? S8(src, w, h, bx + 0, by - 2) : S8(src, w, h, bx + 4, by + 0);
+                    uint8_t b4 = (ly == 2) ? S8(src, w, h, bx + 2, by - 2) : S8(src, w, h, bx + 2, by + 4);
+
+                    val = (b1 + b2 + b3 + b4) / 4;
+                }
+            }
+
+            dst[y * w + x] = val;
+        }
+    }
+}
+
+// Forward declarations for raw capture functions
+static int InitRawCapture(struct raw_capture_info* raw_info, uint32_t width, uint32_t height);
+static void DeinitRawCapture(struct raw_capture_info* raw_info);
+
 static int DoCaptureYuv(int sockfd)
 {
     LOG_DEBUG("DoCaptureYuv begin\n");
     g_inCaptureYUVProcess = 1;
+    
+    // Initialize raw capture from video0 to video17 (no separate thread)
+    LOG_INFO("Initializing raw capture from video0 to video17\n");
+    if (InitRawCapture(&g_raw_capture_info, g_width, g_height) < 0) {
+        LOG_ERROR("Failed to initialize raw capture, continuing with main path\n");
+    } else {
+        // Activate raw capture
+        g_raw_capture_info.capture_active = 1;
+        LOG_INFO("Raw capture initialized and activated: video0 -> video17\n");
+    }
+    
     if (g_startOfflineRawFlag == 1)
     {
         if (g_offlineRAWCaptureYUVStepCounter != 0)
@@ -1113,8 +1203,86 @@ static int DoCaptureYuv(int sockfd)
             }
 
             virtual_sequence = 0;
+            
+            // Discard first frame to ensure fresh data on capture start
+            if (capture_frames_index == 0 && g_raw_capture_info.capture_active) {
+                LOG_DEBUG("Discarding first frame to ensure fresh capture data\n");
+                // DQ and discard one frame from main capture device
+                struct v4l2_buffer discard_buf;
+                struct v4l2_plane discard_planes[FMT_NUM_PLANES];
+                CLEAR(discard_buf);
+                CLEAR(discard_planes);
+                discard_buf.type = (v4l2_buf_type)capFmt.type;
+                discard_buf.memory = V4L2_MEMORY_MMAP;
+                if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == (v4l2_buf_type)capFmt.type) {
+                    discard_buf.m.planes = discard_planes;
+                    discard_buf.length = FMT_NUM_PLANES;
+                }
+                if (xioctl(fd, VIDIOC_DQBUF, &discard_buf) >= 0) {
+                    // Immediately requeue to keep buffer flow active
+                    if (xioctl(fd, VIDIOC_QBUF, &discard_buf) < 0) {
+                        LOG_ERROR("Discard frame QBUF failed\n");
+                    }
+                    LOG_DEBUG("First frame discarded successfully\n");
+                }
+            }
+            
             while (capture_frames_index < capture_frames)
             {
+                // Raw capture processing: video0 -> video17
+                if (g_raw_capture_info.capture_active && g_raw_capture_info.fd_sensor >= 0 && g_raw_capture_info.fd_rawrd >= 0) {
+                    // DQ one sensor frame from video0
+                    struct v4l2_buffer sensor_buf = { 0 };
+                    struct v4l2_plane sensor_planes[VIDEO_MAX_PLANES] = { { 0 } };
+                    sensor_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    sensor_buf.memory = V4L2_MEMORY_MMAP;
+                    sensor_buf.length = 1;
+                    sensor_buf.m.planes = sensor_planes;
+                    
+                    if (xioctl(g_raw_capture_info.fd_sensor, VIDIOC_DQBUF, &sensor_buf) >= 0) {
+                        size_t in_bytes = sensor_planes[0].bytesused ? sensor_planes[0].bytesused : (size_t)g_raw_capture_info.width * g_raw_capture_info.height;
+                        if (in_bytes > (size_t)g_raw_capture_info.width * g_raw_capture_info.height) {
+                            in_bytes = (size_t)g_raw_capture_info.width * g_raw_capture_info.height;
+                        }
+                        
+                        // Copy sensor data to conversion buffer
+                        memcpy(g_raw_capture_info.conversion_buffer, g_raw_capture_info.sensor_buffers[sensor_buf.index].start, in_bytes);
+                        
+                        // Requeue sensor buffer immediately
+                        if (xioctl(g_raw_capture_info.fd_sensor, VIDIOC_QBUF, &sensor_buf) < 0) {
+                            LOG_ERROR("Sensor reQBUF failed: %s\n", strerror(errno));
+                        }
+                        
+                        // DQ one OUTPUT buffer from video17
+                        struct v4l2_buffer rawrd_buf = { 0 };
+                        struct v4l2_plane rawrd_planes[VIDEO_MAX_PLANES] = { { 0 } };
+                        rawrd_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+                        rawrd_buf.memory = V4L2_MEMORY_MMAP;
+                        rawrd_buf.length = 1;
+                        rawrd_buf.m.planes = rawrd_planes;
+                        rawrd_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+                        struct timespec tspec;
+                        clock_gettime(CLOCK_MONOTONIC, &tspec);
+                        rawrd_buf.timestamp.tv_sec = tspec.tv_sec;
+                        rawrd_buf.timestamp.tv_usec = tspec.tv_nsec / 1000;
+                        
+                        if (xioctl(g_raw_capture_info.fd_rawrd, VIDIOC_DQBUF, &rawrd_buf) >= 0) {
+                            // Convert RGB-IR to BGGR and copy to raw reader buffer
+                            rgbir_to_bggr((uint8_t*)g_raw_capture_info.rawrd_buffers[rawrd_buf.index].start, 
+                                          g_raw_capture_info.conversion_buffer, 
+                                          g_raw_capture_info.width, g_raw_capture_info.height);
+                            
+                            rawrd_planes[0].bytesused = g_raw_capture_info.sizeimage;
+                            rawrd_planes[0].length = g_raw_capture_info.rawrd_buffers[rawrd_buf.index].length;
+                            rawrd_planes[0].data_offset = 0;
+                            
+                            if (xioctl(g_raw_capture_info.fd_rawrd, VIDIOC_QBUF, &rawrd_buf) < 0) {
+                                LOG_ERROR("Raw reader QBUF failed: %s\n", strerror(errno));
+                            }
+                        }
+                    }
+                }
+
                 struct v4l2_buffer buf;
                 struct v4l2_plane planes[FMT_NUM_PLANES];
                 CLEAR(buf);
@@ -1217,6 +1385,15 @@ static int DoCaptureYuv(int sockfd)
     {
         thread.join();
     }
+    
+    // Cleanup raw capture after main capture is complete
+    LOG_INFO("Cleaning up raw capture\n");
+    if (g_raw_capture_info.capture_active)
+    {
+        DeinitRawCapture(&g_raw_capture_info);
+        g_raw_capture_info.capture_active = 0;
+    }
+    
     g_inCaptureYUVProcess = 0;
 
     LOG_DEBUG("DoCaptureYuv end\n");
@@ -1237,6 +1414,435 @@ static void RawCaptureDeinit(struct capture_info* cap_info)
         cap_info->dev_fd = -1;
         LOG_DEBUG("device_close(cap_info.dev_fd)\n");
     }
+}
+
+// Raw capture functions for RGB-IR to BGGR conversion
+static int InitRawCapture(struct raw_capture_info* raw_info, uint32_t width, uint32_t height)
+{
+    LOG_DEBUG("InitRawCapture begin: %dx%d\n", width, height);
+    
+    memset(raw_info, 0, sizeof(*raw_info));
+    raw_info->width = width;
+    raw_info->height = height;
+    raw_info->fd_sensor = -1;
+    raw_info->fd_rawrd = -1;
+    
+    // Allocate conversion buffer
+    raw_info->conversion_buffer = (uint8_t*)malloc(width * height);
+    if (!raw_info->conversion_buffer) {
+        LOG_ERROR("Failed to allocate conversion buffer\n");
+        return -1;
+    }
+    
+    // Open sensor device (/dev/video0)
+    raw_info->fd_sensor = open("/dev/video0", O_RDWR | O_NONBLOCK);
+    if (raw_info->fd_sensor < 0) {
+        LOG_ERROR("Failed to open /dev/video0: %s\n", strerror(errno));
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Setup sensor format
+    struct v4l2_format fmt_in = { 0 };
+    fmt_in.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    fmt_in.fmt.pix_mp.width = width;
+    fmt_in.fmt.pix_mp.height = height;
+    fmt_in.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SBGGR8;
+    fmt_in.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    fmt_in.fmt.pix_mp.num_planes = 1;
+    
+    if (xioctl(raw_info->fd_sensor, VIDIOC_S_FMT, &fmt_in) < 0) {
+        LOG_ERROR("Failed to set sensor format: %s\n", strerror(errno));
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Request sensor buffers
+    struct v4l2_requestbuffers req_in = { 0 };
+    req_in.count = 1;
+    req_in.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req_in.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(raw_info->fd_sensor, VIDIOC_REQBUFS, &req_in) < 0) {
+        LOG_ERROR("Failed to request sensor buffers: %s\n", strerror(errno));
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    raw_info->sensor_buffer_count = req_in.count;
+    raw_info->sensor_buffers = (struct RawCaptureBuffer*)calloc(req_in.count, sizeof(*raw_info->sensor_buffers));
+    if (!raw_info->sensor_buffers) {
+        LOG_ERROR("Failed to allocate sensor buffers\n");
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Map sensor buffers
+    for (unsigned int i = 0; i < req_in.count; ++i) {
+        struct v4l2_buffer b = { 0 };
+        struct v4l2_plane planes[VIDEO_MAX_PLANES] = { { 0 } };
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        b.length = 1;
+        b.m.planes = planes;
+        
+        if (xioctl(raw_info->fd_sensor, VIDIOC_QUERYBUF, &b) < 0) {
+            LOG_ERROR("Failed to query sensor buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j < i; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+        
+        raw_info->sensor_buffers[i].length = planes[0].length;
+        raw_info->sensor_buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, raw_info->fd_sensor, planes[0].m.mem_offset);
+        if (raw_info->sensor_buffers[i].start == MAP_FAILED) {
+            LOG_ERROR("Failed to mmap sensor buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j < i; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+        
+        if (xioctl(raw_info->fd_sensor, VIDIOC_QBUF, &b) < 0) {
+            LOG_ERROR("Failed to queue sensor buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j <= i; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+    }
+    
+    // Start sensor stream
+    enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (xioctl(raw_info->fd_sensor, VIDIOC_STREAMON, &cap_type) < 0) {
+        LOG_ERROR("Failed to start sensor stream: %s\n", strerror(errno));
+        // Cleanup
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Open raw reader device (/dev/video17)
+    raw_info->fd_rawrd = open("/dev/video17", O_RDWR | O_NONBLOCK);
+    if (raw_info->fd_rawrd < 0) {
+        LOG_ERROR("Failed to open /dev/video17: %s\n", strerror(errno));
+        // Cleanup sensor
+        enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Setup raw reader format
+    struct v4l2_format fmt_out = { 0 };
+    fmt_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    fmt_out.fmt.pix_mp.width = width;
+    fmt_out.fmt.pix_mp.height = height;
+    fmt_out.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SBGGR8;
+    fmt_out.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    fmt_out.fmt.pix_mp.num_planes = 1;
+    
+    if (xioctl(raw_info->fd_rawrd, VIDIOC_S_FMT, &fmt_out) < 0) {
+        LOG_ERROR("Failed to set raw reader format: %s\n", strerror(errno));
+        close(raw_info->fd_rawrd);
+        // Cleanup sensor
+        enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    raw_info->bpl = fmt_out.fmt.pix_mp.plane_fmt[0].bytesperline;
+    raw_info->sizeimage = fmt_out.fmt.pix_mp.plane_fmt[0].sizeimage;
+    if (raw_info->sizeimage == 0) {
+        raw_info->sizeimage = (size_t)raw_info->bpl * height;
+    }
+    
+    LOG_DEBUG("Raw reader: width=%u height=%u bpl=%u sizeimage=%zu\n", 
+              fmt_out.fmt.pix_mp.width, fmt_out.fmt.pix_mp.height, raw_info->bpl, raw_info->sizeimage);
+    
+    // Request raw reader buffers
+    struct v4l2_requestbuffers req_out = { 0 };
+    req_out.count = 1;
+    req_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    req_out.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(raw_info->fd_rawrd, VIDIOC_REQBUFS, &req_out) < 0) {
+        LOG_ERROR("Failed to request raw reader buffers: %s\n", strerror(errno));
+        close(raw_info->fd_rawrd);
+        // Cleanup sensor
+        enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    raw_info->rawrd_buffer_count = req_out.count;
+    raw_info->rawrd_buffers = (struct RawCaptureBuffer*)calloc(req_out.count, sizeof(*raw_info->rawrd_buffers));
+    if (!raw_info->rawrd_buffers) {
+        LOG_ERROR("Failed to allocate raw reader buffers\n");
+        close(raw_info->fd_rawrd);
+        // Cleanup sensor
+        enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    // Map raw reader buffers
+    for (unsigned int i = 0; i < req_out.count; ++i) {
+        struct v4l2_buffer b = { 0 };
+        struct v4l2_plane planes[VIDEO_MAX_PLANES] = { { 0 } };
+        b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        b.length = 1;
+        b.m.planes = planes;
+        
+        if (xioctl(raw_info->fd_rawrd, VIDIOC_QUERYBUF, &b) < 0) {
+            LOG_ERROR("Failed to query raw reader buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j < i; ++j) {
+                munmap(raw_info->rawrd_buffers[j].start, raw_info->rawrd_buffers[j].length);
+            }
+            free(raw_info->rawrd_buffers);
+            close(raw_info->fd_rawrd);
+            // Cleanup sensor
+            enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+            for (unsigned int j = 0; j < raw_info->sensor_buffer_count; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+        
+        raw_info->rawrd_buffers[i].length = planes[0].length;
+        raw_info->rawrd_buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, raw_info->fd_rawrd, planes[0].m.mem_offset);
+        if (raw_info->rawrd_buffers[i].start == MAP_FAILED) {
+            LOG_ERROR("Failed to mmap raw reader buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j < i; ++j) {
+                munmap(raw_info->rawrd_buffers[j].start, raw_info->rawrd_buffers[j].length);
+            }
+            free(raw_info->rawrd_buffers);
+            close(raw_info->fd_rawrd);
+            // Cleanup sensor
+            enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+            for (unsigned int j = 0; j < raw_info->sensor_buffer_count; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+    }
+    
+    // Pre-queue raw reader buffers
+    for (unsigned int i = 0; i < req_out.count; ++i) {
+        struct v4l2_buffer b = { 0 };
+        struct v4l2_plane planes[VIDEO_MAX_PLANES] = { { 0 } };
+        b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        b.length = 1;
+        b.m.planes = planes;
+        planes[0].bytesused = raw_info->sizeimage;
+        planes[0].length = raw_info->rawrd_buffers[i].length;
+        planes[0].data_offset = 0;
+        
+        if (xioctl(raw_info->fd_rawrd, VIDIOC_QBUF, &b) < 0) {
+            LOG_ERROR("Failed to queue raw reader buffer %d: %s\n", i, strerror(errno));
+            // Cleanup
+            for (unsigned int j = 0; j < raw_info->rawrd_buffer_count; ++j) {
+                munmap(raw_info->rawrd_buffers[j].start, raw_info->rawrd_buffers[j].length);
+            }
+            free(raw_info->rawrd_buffers);
+            close(raw_info->fd_rawrd);
+            // Cleanup sensor
+            enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+            for (unsigned int j = 0; j < raw_info->sensor_buffer_count; ++j) {
+                munmap(raw_info->sensor_buffers[j].start, raw_info->sensor_buffers[j].length);
+            }
+            free(raw_info->sensor_buffers);
+            close(raw_info->fd_sensor);
+            free(raw_info->conversion_buffer);
+            return -1;
+        }
+    }
+    
+    // Start raw reader stream
+    enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    if (xioctl(raw_info->fd_rawrd, VIDIOC_STREAMON, &out_type) < 0) {
+        LOG_ERROR("Failed to start raw reader stream: %s\n", strerror(errno));
+        // Cleanup
+        for (unsigned int i = 0; i < raw_info->rawrd_buffer_count; ++i) {
+            munmap(raw_info->rawrd_buffers[i].start, raw_info->rawrd_buffers[i].length);
+        }
+        free(raw_info->rawrd_buffers);
+        close(raw_info->fd_rawrd);
+        // Cleanup sensor
+        enum v4l2_buf_type cap_type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type_off);
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+        }
+        free(raw_info->sensor_buffers);
+        close(raw_info->fd_sensor);
+        free(raw_info->conversion_buffer);
+        return -1;
+    }
+    
+    raw_info->capture_active = 1;
+    
+    // Flush initial buffers to ensure fresh data on first capture
+    LOG_DEBUG("Flushing initial buffers to eliminate stale data\n");
+    for (int flush_count = 0; flush_count < 2; flush_count++) {
+        // DQ and discard one frame from sensor
+        struct v4l2_buffer sensor_buf = { 0 };
+        struct v4l2_plane sensor_planes[VIDEO_MAX_PLANES] = { { 0 } };
+        sensor_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        sensor_buf.memory = V4L2_MEMORY_MMAP;
+        sensor_buf.length = 1;
+        sensor_buf.m.planes = sensor_planes;
+        
+        if (xioctl(raw_info->fd_sensor, VIDIOC_DQBUF, &sensor_buf) >= 0) {
+            // Immediately requeue to keep buffer flow active
+            if (xioctl(raw_info->fd_sensor, VIDIOC_QBUF, &sensor_buf) < 0) {
+                LOG_ERROR("Sensor flush QBUF failed: %s\n", strerror(errno));
+            }
+        }
+        
+        // DQ and discard one frame from raw reader
+        struct v4l2_buffer rawrd_buf = { 0 };
+        struct v4l2_plane rawrd_planes[VIDEO_MAX_PLANES] = { { 0 } };
+        rawrd_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        rawrd_buf.memory = V4L2_MEMORY_MMAP;
+        rawrd_buf.length = 1;
+        rawrd_buf.m.planes = rawrd_planes;
+        
+        if (xioctl(raw_info->fd_rawrd, VIDIOC_DQBUF, &rawrd_buf) >= 0) {
+            // Clear the buffer and requeue
+            memset(raw_info->rawrd_buffers[rawrd_buf.index].start, 0, raw_info->rawrd_buffers[rawrd_buf.index].length);
+            rawrd_planes[0].bytesused = 0;
+            rawrd_planes[0].length = raw_info->rawrd_buffers[rawrd_buf.index].length;
+            rawrd_planes[0].data_offset = 0;
+            
+            if (xioctl(raw_info->fd_rawrd, VIDIOC_QBUF, &rawrd_buf) < 0) {
+                LOG_ERROR("Raw reader flush QBUF failed: %s\n", strerror(errno));
+            }
+        }
+        
+        // Small delay to allow buffer processing
+        usleep(10000); // 10ms
+    }
+    
+    LOG_DEBUG("InitRawCapture completed successfully with buffer flush\n");
+    return 0;
+}
+
+static void DeinitRawCapture(struct raw_capture_info* raw_info)
+{
+    LOG_DEBUG("DeinitRawCapture begin\n");
+    
+    if (!raw_info) return;
+    
+    raw_info->capture_active = 0;
+    
+    // Stop streams
+    if (raw_info->fd_sensor >= 0) {
+        enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(raw_info->fd_sensor, VIDIOC_STREAMOFF, &cap_type);
+    }
+    
+    if (raw_info->fd_rawrd >= 0) {
+        enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        xioctl(raw_info->fd_rawrd, VIDIOC_STREAMOFF, &out_type);
+    }
+    
+    // Unmap buffers
+    if (raw_info->sensor_buffers) {
+        for (unsigned int i = 0; i < raw_info->sensor_buffer_count; ++i) {
+            if (raw_info->sensor_buffers[i].start != MAP_FAILED) {
+                munmap(raw_info->sensor_buffers[i].start, raw_info->sensor_buffers[i].length);
+            }
+        }
+        free(raw_info->sensor_buffers);
+        raw_info->sensor_buffers = NULL;
+    }
+    
+    if (raw_info->rawrd_buffers) {
+        for (unsigned int i = 0; i < raw_info->rawrd_buffer_count; ++i) {
+            if (raw_info->rawrd_buffers[i].start != MAP_FAILED) {
+                munmap(raw_info->rawrd_buffers[i].start, raw_info->rawrd_buffers[i].length);
+            }
+        }
+        free(raw_info->rawrd_buffers);
+        raw_info->rawrd_buffers = NULL;
+    }
+    
+    // Close devices
+    if (raw_info->fd_sensor >= 0) {
+        close(raw_info->fd_sensor);
+        raw_info->fd_sensor = -1;
+    }
+    
+    if (raw_info->fd_rawrd >= 0) {
+        close(raw_info->fd_rawrd);
+        raw_info->fd_rawrd = -1;
+    }
+    
+    // Free conversion buffer
+    if (raw_info->conversion_buffer) {
+        free(raw_info->conversion_buffer);
+        raw_info->conversion_buffer = NULL;
+    }
+    
+    LOG_DEBUG("DeinitRawCapture completed\n");
 }
 
 static void DumpCapinfo()
